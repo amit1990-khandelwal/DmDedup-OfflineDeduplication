@@ -1,0 +1,170 @@
+diff --git a/drivers/md/dm-dedup-target.c b/drivers/md/dm-dedup-target.c
+index dc766c1..00ef4e4 100644
+--- a/drivers/md/dm-dedup-target.c
++++ b/drivers/md/dm-dedup-target.c
+@@ -131,6 +131,38 @@ static int write_to_new_block(struct dedup_config *dc, uint64_t *pbn_new,
+ 	return r;
+ }
+ 
++static int handle_write_nodedup(struct dedup_config *dc, struct bio *bio,
++			     uint64_t lbn)
++{
++	int r, ret;
++	uint32_t vsize;
++	uint64_t pbn_new, pbn_old;
++	struct lbn_pbn_value lbnpbn_value;
++
++	r = dc->kvs_lbn_pbn->kvs_lookup(dc->kvs_lbn_pbn, (void *)&lbn, sizeof(lbn),
++				(void *)&lbnpbn_value, &vsize);
++	if (r == 0) {
++		r = write_to_new_block(dc, &pbn_new, bio, lbn);
++		goto out;
++	} else if (r < 0)
++		BUG();
++
++	pbn_old = lbnpbn_value.pbn;
++
++	r = write_to_new_block(dc, &pbn_new, bio, lbn);
++	if (r < 0)
++		goto out;
++
++	ret = dc->mdops->dec_refcount(dc->bmd, pbn_old);
++	if (ret < 0)
++		BUG();
++
++	dc->logical_block_counter--;
++
++out:
++	return r;
++}
++
+ static int handle_write_no_hash(struct dedup_config *dc,
+ 				struct bio *bio, uint64_t lbn, u8 *hash)
+ {
+@@ -337,6 +369,12 @@ static int handle_write(struct dedup_config *dc, struct bio *bio)
+ 
+ 	lbn = bio_lbn(dc, bio);
+ 
++	if (bio_flagged(bio, BIO_NO_DEDUP)) {
++		dc->nodedup_writes++;
++		(void)handle_write_nodedup(dc, bio, lbn);
++		goto flush;
++	}
++
+ 	r = compute_hash_bio(dc->desc_table, bio, hash);
+ 	if (r)
+ 		return r;
+@@ -392,6 +430,12 @@ static void do_work(struct work_struct *ws)
+ 	process_bio(dc, bio);
+ }
+ 
++static void set_nodedup_flag(struct dedup_config *dc, struct bio *bio)
++{
++	if (dc->nodedup_all)
++		bio->bi_flags |= (1 << BIO_NO_DEDUP);
++}
++
+ static void dedup_defer_bio(struct dedup_config *dc, struct bio *bio)
+ {
+ 	struct dedup_work *data;
+@@ -402,6 +446,8 @@ static void dedup_defer_bio(struct dedup_config *dc, struct bio *bio)
+ 		return;
+ 	}
+ 
++	set_nodedup_flag(dc, bio);
++
+ 	data->bio = bio;
+ 	data->config = dc;
+ 
+@@ -433,8 +479,22 @@ struct dedup_args {
+ 	char backend_str[MAX_BACKEND_NAME_LEN];
+ 
+ 	uint32_t flushrq;
++
++	int nodedup_all;
+ };
+ 
++static int parse_nodedup_hint_all(struct dedup_args *da, struct dm_arg_set *as,
++				char **err)
++{
++	if (kstrtoint(dm_shift_arg(as), 10, &da->nodedup_all) ||
++		(da->nodedup_all != 0 && da->nodedup_all != 1)) {
++		*err = "Invalid value for nodedup all hint";
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static int parse_meta_dev(struct dedup_args *da, struct dm_arg_set *as,
+ 			  char **err)
+ {
+@@ -536,12 +596,12 @@ static int parse_dedup_args(struct dedup_args *da, int argc,
+ 	struct dm_arg_set as;
+ 	int r;
+ 
+-	if (argc < 6) {
++	if (argc < 7) {
+ 		*err = "Insufficient args";
+ 		return -EINVAL;
+ 	}
+ 
+-	if (argc > 6) {
++	if (argc > 7) {
+ 		*err = "Too many args";
+ 		return -EINVAL;
+ 	}
+@@ -573,6 +633,10 @@ static int parse_dedup_args(struct dedup_args *da, int argc,
+ 	if (r)
+ 		return r;
+ 
++	r = parse_nodedup_hint_all(da, &as, err);
++	if (r)
++		return r;
++
+ 	return 0;
+ }
+ 
+@@ -728,6 +792,8 @@ static int dm_dedup_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 	dc->dedup_work_pool = dedup_work_pool;
+ 	dc->bmd = md;
+ 
++	dc->nodedup_all = da.nodedup_all;
++
+ 	dc->logical_block_counter = logical_block_counter;
+ 	dc->physical_block_counter = physical_block_counter;
+ 
+@@ -737,6 +803,7 @@ static int dm_dedup_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 	dc->reads_on_writes = 0;
+ 	dc->overwrites = 0;
+ 	dc->newwrites = 0;
++	dc->nodedup_writes = 0;
+ 
+ 	strcpy(dc->crypto_alg, da.hash_algo);
+ 	dc->crypto_key_size = crypto_key_size;
+@@ -831,9 +898,9 @@ static void dm_dedup_status(struct dm_target *ti, status_type_t status_type,
+ 		DMEMIT("%u %s %s ", dc->block_size,
+ 			dc->data_dev->name, dc->metadata_dev->name);
+ 
+-		DMEMIT("%llu %llu %llu %llu %llu %llu",
++		DMEMIT("%llu %llu %llu %llu %llu %llu %llu",
+ 			dc->writes, dc->uniqwrites, dc->dupwrites,
+-			dc->reads_on_writes, dc->overwrites, dc->newwrites);
++			dc->reads_on_writes, dc->overwrites, dc->newwrites, dc->nodedup_writes);
+ 		break;
+ 	case STATUSTYPE_TABLE:
+ 		DMEMIT("%s %s %u %s %s %u",
+diff --git a/drivers/md/dm-dedup-target.h b/drivers/md/dm-dedup-target.h
+index dea8eac..a349fb9 100644
+--- a/drivers/md/dm-dedup-target.h
++++ b/drivers/md/dm-dedup-target.h
+@@ -71,6 +71,9 @@ struct dedup_config {
+ 	uint64_t	reads_on_writes;
+ 	uint64_t	overwrites;	/* writes to a prev. written offset */
+ 	uint64_t	newwrites;	/* writes to never written offsets */
++	uint64_t	nodedup_writes;	/* writes which aren't deduplicated */
++
++	int		nodedup_all;	/* Enable nodedup hint for all writes */
+ 
+ 	struct dm_io_client *io_client;		/* used for read-on-write
+ 						   of misaligned requests */
